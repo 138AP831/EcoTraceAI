@@ -1,0 +1,24 @@
+{
+  "counts": {
+    "collections": 120,
+    "facilities": 8,
+    "obligations": 14,
+    "pickers": 12,
+    "producers": 6,
+    "scenarios": {
+      "borderline_evidence": 22,
+      "clean_dismantled": 16,
+      "clean_intact": 32,
+      "duplicate": 8,
+      "facility_lapsed": 5,
+      "invoice_mismatch": 4,
+      "late_completion": 6,
+      "low_quality": 12,
+      "missing_manifest": 4,
+      "narration_borderline": 6,
+      "numeric_mismatch": 5
+    }
+  },
+  "rng_seed": 42,
+  "synthetic": true
+}
