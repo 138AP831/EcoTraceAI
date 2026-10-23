@@ -156,19 +156,194 @@ def print_summary(plan: dict, session):
         print(f"  {sc:24s} {parts}")
 
 
+def run_edge_load(client, edge_plan: dict) -> dict:
+    """Replay the edge-case plan through the API.
+
+    Only records that have all required fields are submitted.  Records with
+    facility/picker ids that were NOT created by this run (e.g. B9 which uses
+    a fake facility_id) are skipped at the collection-create step — the test
+    suite covers those cases independently.
+
+    Returns {scenario_tag: collection_id} for the submitted records.
+    """
+    # Facilities
+    for f in edge_plan["facilities"]:
+        body = {k: v for k, v in f.items() if k != "is_synthetic"}
+        r = client.post("/facilities", json=body)
+        if r.status_code not in (201, 409):
+            print(f"  [WARN] facility {f.get('registration_no')} → {r.status_code}: {r.text[:80]}")
+
+    # Pickers
+    for p in edge_plan["pickers"]:
+        body = {k: v for k, v in p.items() if k != "is_synthetic"}
+        r = client.post("/pickers", json=body)
+        if r.status_code not in (201, 409):
+            print(f"  [WARN] picker {p.get('phone')} → {r.status_code}: {r.text[:80]}")
+
+    # Producers
+    for p in edge_plan["producers"]:
+        body = {k: v for k, v in p.items() if k != "is_synthetic"}
+        r = client.post("/producers", json=body)
+        if r.status_code not in (201,):
+            print(f"  [WARN] producer {p.get('name')} → {r.status_code}: {r.text[:80]}")
+
+    # Obligations
+    for o in edge_plan["obligations"]:
+        body = {k: v for k, v in o.items()
+                if k not in ("is_synthetic", "producer_id", "fulfilled_kg")}
+        r = client.post(f"/producers/{o['producer_id']}/obligations", json=body)
+        if r.status_code not in (201, 409):
+            print(f"  [WARN] obligation {o.get('id')} → {r.status_code}: {r.text[:80]}")
+
+    submitted: dict[str, str] = {}   # scenario_tag → collection_id
+
+    for rec in edge_plan["records"]:
+        tag    = rec["scenario_tag"]
+        create = rec.get("create")
+        if not create:
+            continue
+
+        # Strip non-model fields before posting
+        _EXTRA = {"lot_id", "offline_sync", "original_capture_at",
+                  "original_ist_timestamp", "previous_record_id"}
+        col_body = {k: v for k, v in create.items() if k not in _EXTRA}
+
+        r = client.post("/collections", json=col_body)
+        if r.status_code != 201:
+            # Expected for B9 (fake facility), C12 (zero/negative weight), I1 (bad picker)
+            continue
+
+        cid = r.json()["id"]
+        submitted[tag] = cid
+
+        ev = rec.get("evidence")
+        if ev:
+            client.post(f"/collections/{cid}/evidence", json=ev)
+
+        hitl_ev = rec.get("hitl_evidence")
+        if hitl_ev:
+            client.post(f"/collections/{cid}/hitl-approve",
+                        json={"stage": "evidence", "approved": hitl_ev["approved"]})
+
+        comp = rec.get("completion")
+        if comp:
+            client.post(f"/collections/{cid}/completion", json=comp)
+
+        nar = rec.get("narration")
+        if nar:
+            client.post(f"/collections/{cid}/narration", json=nar)
+
+        hitl_nar = rec.get("hitl_narration")
+        if hitl_nar:
+            client.post(f"/collections/{cid}/hitl-approve",
+                        json={"stage": "narration",
+                              "approved": hitl_nar["approved"]})
+
+    return submitted
+
+
+def print_edge_summary(edge_plan: dict, submitted: dict):
+    """Print a summary table grouped by scenario_tag group and expected decision."""
+    tags: dict[str, int] = {}
+    ev_counts: dict[str, int] = {}
+    gate_counts: dict[str, int] = {}
+    nar_counts: dict[str, int] = {}
+
+    for rec in edge_plan["records"]:
+        t = rec["scenario_tag"]
+        tags[t] = tags.get(t, 0) + 1
+        e = rec["expected_evidence_decision"]
+        g = rec["expected_gate"]
+        n = rec["expected_narration_decision"]
+        ev_counts[e]   = ev_counts.get(e, 0) + 1
+        gate_counts[g] = gate_counts.get(g, 0) + 1
+        nar_counts[n]  = nar_counts.get(n, 0) + 1
+
+    print("=" * 60)
+    print("EDGE-CASE SEED — scenario_tag group counts")
+    print("=" * 60)
+    group_counts: dict[str, int] = {}
+    for t, c in tags.items():
+        g = t[0] if t != "CLEAN" else "CLEAN"
+        group_counts[g] = group_counts.get(g, 0) + c
+    for g in sorted(group_counts):
+        print(f"  {g:10s} {group_counts[g]}")
+
+    print("=" * 60)
+    print("EDGE-CASE SEED — expected decision counts")
+    print("=" * 60)
+    print(f"  {'evidence_decision':30s} {'gate':15s} {'narration_decision':20s}")
+    print(f"  {'-'*30} {'-'*15} {'-'*20}")
+    all_ev  = sorted(ev_counts)
+    all_g   = sorted(gate_counts)
+    all_nar = sorted(nar_counts)
+    for i in range(max(len(all_ev), len(all_g), len(all_nar))):
+        e_lbl = f"{all_ev[i]:20s} {ev_counts[all_ev[i]]}"   if i < len(all_ev)  else ""
+        g_lbl = f"{all_g[i]:10s} {gate_counts[all_g[i]]}"   if i < len(all_g)   else ""
+        n_lbl = f"{all_nar[i]:15s} {nar_counts[all_nar[i]]}" if i < len(all_nar) else ""
+        print(f"  {e_lbl:30s} {g_lbl:15s} {n_lbl}")
+
+    print(f"\n  Total records:  {len(edge_plan['records'])}")
+    print(f"  Submitted via API: {len(submitted)}")
+    print("=" * 60)
+
+
 def main():
     import argparse
     from seed.generate import build_plan, write_files
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--reset", action="store_true")
-    parser.add_argument("--plan", default=os.path.join(DATA_DIR, "plan.json"))
+    parser = argparse.ArgumentParser(
+        description="Load EcoTrace seed data. Use --edge for the edge-case dataset.")
+    parser.add_argument("--reset", action="store_true",
+                        help="Drop and recreate the DB before loading")
+    parser.add_argument("--plan", default=os.path.join(DATA_DIR, "plan.json"),
+                        help="Path to plan.json (original seed)")
+    parser.add_argument("--edge", action="store_true",
+                        help="Load the edge-case seed instead of the original seed")
     args = parser.parse_args()
 
     if args.reset:
         drop_db()
         init_db()
 
+    # ── Edge-case seed ────────────────────────────────────────────────────────
+    if args.edge:
+        from seed.edge_cases import build_edge_plan, write_edge_files
+        from app.auth import create_access_token, hash_password
+        from app.models import User
+
+        # Build / write edge plan
+        edge_plan = build_edge_plan()
+        write_edge_files(edge_plan, DATA_DIR)
+
+        # Need an admin token so protected routes are accessible
+        session = SessionLocal()
+        try:
+            admin = session.query(User).filter(User.email == "seed_admin@ecotrace.local").first()
+            if not admin:
+                from app.models import User as U
+                admin = U(
+                    email="seed_admin@ecotrace.local",
+                    hashed_password=hash_password("seedadmin1"),
+                    role="admin",
+                    full_name="Seed Admin",
+                    is_active=True,
+                )
+                session.add(admin)
+                session.commit()
+                session.refresh(admin)
+            token = create_access_token(subject=admin.id, role="admin")
+        finally:
+            session.close()
+
+        headers = {"Authorization": f"Bearer {token}"}
+        client  = TestClient(app, headers=headers)
+        submitted = run_edge_load(client, edge_plan)
+
+        print_edge_summary(edge_plan, submitted)
+        return
+
+    # ── Original seed ─────────────────────────────────────────────────────────
     if not os.path.exists(args.plan):
         plan = build_plan()
         write_files(plan, os.path.dirname(args.plan) or DATA_DIR)
@@ -176,7 +351,30 @@ def main():
         with open(args.plan, encoding="utf-8") as f:
             plan = json.load(f)
 
-    client = TestClient(app)
+    # Need an admin token for the original seed too
+    from app.auth import create_access_token, hash_password
+    from app.models import User
+
+    session = SessionLocal()
+    try:
+        admin = session.query(User).filter(User.email == "seed_admin@ecotrace.local").first()
+        if not admin:
+            admin = User(
+                email="seed_admin@ecotrace.local",
+                hashed_password=hash_password("seedadmin1"),
+                role="admin",
+                full_name="Seed Admin",
+                is_active=True,
+            )
+            session.add(admin)
+            session.commit()
+            session.refresh(admin)
+        token = create_access_token(subject=admin.id, role="admin")
+    finally:
+        session.close()
+
+    headers = {"Authorization": f"Bearer {token}"}
+    client  = TestClient(app, headers=headers)
     run_load(client, plan)
 
     session = SessionLocal()

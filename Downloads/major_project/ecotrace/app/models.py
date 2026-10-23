@@ -224,6 +224,30 @@ class BadgeReference(TimestampMixin, Base):
     weight_kg_applied: Mapped[float] = mapped_column(Float, nullable=False)
 
 
+class User(TimestampMixin, Base):
+    """Application user. Role is one of: admin, operator, viewer."""
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String, nullable=False)
+    role: Mapped[str] = mapped_column(String, nullable=False, default="viewer")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+
+class MediaFile(TimestampMixin, Base):
+    """File attached to a collection (evidence media or invoice)."""
+    __tablename__ = "media_files"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
+    collection_id: Mapped[str] = mapped_column(String, ForeignKey("collections.id"), nullable=False)
+    filename: Mapped[str] = mapped_column(String, nullable=False)
+    content_type: Mapped[str] = mapped_column(String, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    storage_path: Mapped[str] = mapped_column(String, nullable=False)
+    file_purpose: Mapped[str] = mapped_column(String, nullable=False, default="evidence_media")
+    uploaded_by: Mapped[Optional[str]] = mapped_column(String, ForeignKey("users.id"), nullable=True)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
