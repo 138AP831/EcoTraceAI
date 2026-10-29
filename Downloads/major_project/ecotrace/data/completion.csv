@@ -1,0 +1,3 @@
+# Generated later — populated after completion gate is assessed
+# Schema: collection_id,evidence_type,submitted_at,invoice_weight_kg,invoice_buyer_id,
+#         invoice_number,manifest_present,passed,failure_reasons

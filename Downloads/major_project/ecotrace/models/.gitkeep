@@ -1,0 +1,3 @@
+# This folder holds trained model weights.
+# best.pt — YOLO/CV model trained on the e-waste image dataset.
+# Add best.pt here after training. File is excluded from git via .gitignore (too large).

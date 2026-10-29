@@ -99,6 +99,14 @@ class Picker(TimestampMixin, Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=_uuid)
     name: Mapped[str] = mapped_column(String, nullable=False)
     phone: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    # MF#17: block picker after confirmed fraud
+    is_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # MF#18: risk flag — set when rejection rate exceeds threshold
+    # Computed on-demand by the picker risk endpoint; stored for fast filtering.
+    risk_flag: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Counters used to compute rejection rate without a full scan
+    total_submissions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_rejections: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class Facility(TimestampMixin, Base):
@@ -157,6 +165,8 @@ class Collection(TimestampMixin, Base):
     image_hash: Mapped[str] = mapped_column(String, nullable=False)
     intake_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String, nullable=False, default="submitted")
+    # MF#7: set True when input weight was in grams and normalised to kg
+    unit_normalised: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class EvidenceAssessment(TimestampMixin, Base):
@@ -180,6 +190,8 @@ class CompletionRecord(TimestampMixin, Base):
     submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     invoice_weight_kg: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     invoice_buyer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # MF#9: invoice number uniqueness — prevents the same invoice being reused
+    invoice_number: Mapped[Optional[str]] = mapped_column(String, nullable=True, unique=True)
     facility_revalidated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     manifest_present: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

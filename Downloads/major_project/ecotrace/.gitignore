@@ -45,9 +45,21 @@ pip_out.txt
 .env.*
 secrets.json
 
-# Alembic generated migrations (keep env.py and ini, ignore versions if empty)
-alembic/versions/
+# Alembic: track env.py, alembic.ini, and version files
 
 # Seed data — keep CSVs and JSONs, exclude large image binaries from git
 # (images can be regenerated with: python -m seed.images)
 seed/data/images/*.png
+
+# Model weights — too large for git; add to Git LFS or download separately
+models/*.pt
+models/*.pth
+models/*.onnx
+models/*.bin
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# Alembic generated versions — track them
+!alembic/versions/*.py

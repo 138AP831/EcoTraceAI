@@ -84,11 +84,36 @@ class CollectionCreate(BaseModel):
     collection_state: str
     image_hash: str
     intake_at: Optional[datetime] = None
+    # MF#7: unit normalisation flag (set by router when grams converted to kg)
+    unit_normalised: bool = False
 
     @field_validator("intake_at", mode="before")
     @classmethod
     def _naive_intake(cls, v):
         return _to_naive_utc(v)
+
+    @field_validator("declared_weight_kg", mode="before")
+    @classmethod
+    def _validate_declared_weight(cls, v):
+        """MF#6: reject zero, negative, or unreasonably large weights."""
+        v = float(v)
+        if v <= 0:
+            raise ValueError("declared_weight_kg must be > 0")
+        if v > 10_000:
+            raise ValueError("declared_weight_kg must be ≤ 10,000 kg")
+        return v
+
+    @field_validator("weighbridge_weight_kg", mode="before")
+    @classmethod
+    def _validate_weighbridge_weight(cls, v):
+        if v is None:
+            return v
+        v = float(v)
+        if v <= 0:
+            raise ValueError("weighbridge_weight_kg must be > 0")
+        if v > 10_000:
+            raise ValueError("weighbridge_weight_kg must be ≤ 10,000 kg")
+        return v
 
 
 class EvidenceRequest(BaseModel):
@@ -103,6 +128,8 @@ class EvidenceRequest(BaseModel):
     image_quality: Optional[float] = None
     declared_weight_consistency: Optional[float] = None
     weighbridge_weight_consistency: Optional[float] = None
+    # MF#3: optional list of force-review flags from upstream CV/GPS signal processing
+    force_review_flags: list[str] = []
 
 
 class CompletionRequest(BaseModel):
@@ -112,6 +139,8 @@ class CompletionRequest(BaseModel):
     manifest_present: bool
     invoice_weight_kg: Optional[float] = None
     invoice_buyer_id: Optional[str] = None
+    # MF#9: invoice number uniqueness across all CompletionRecords
+    invoice_number: Optional[str] = None
 
     @field_validator("submitted_at", mode="before")
     @classmethod
@@ -128,6 +157,8 @@ class NarrationRequest(BaseModel):
     chronological_consistency: float
     no_gaming_flags: float
     corpus_version: str
+    # MF#3: optional force-review flags
+    force_review_flags: list[str] = []
 
 
 class HitlApproveRequest(BaseModel):
@@ -203,6 +234,7 @@ class CollectionOut(ORMOut):
     image_hash: str
     intake_at: datetime
     status: str
+    unit_normalised: bool = False
 
 
 class EvidenceAssessmentOut(ORMOut):

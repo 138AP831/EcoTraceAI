@@ -2,6 +2,19 @@
 
 Pure: dataclasses in, dataclasses out. No sqlalchemy/fastapi/app.models.
 Weights/thresholds come from app.config only (no literals here).
+
+MF#3: force_review_flags — a list of flag strings that, if non-empty, downgrade
+an auto_verified decision to hitl regardless of the numeric score.
+Flags are set by upstream signal processing (CV/GPS/timestamp checks) before
+the engine is called; the engine itself never sets them.
+
+Supported flags (all lower_snake_case):
+  gps_spoof          — two GPS readings 200+ km apart within 10 min
+  timestamp_mismatch — photo EXIF timestamp differs from intake by > 8h
+  wrong_facility_slip — weighbridge slip from a different facility
+  unknown_category   — device category not in authorised list
+  gaming_flag        — clustering of soft-score gaming signals
+  stale_rule         — narration cites a superseded regulation version
 """
 from __future__ import annotations
 
@@ -47,6 +60,8 @@ class EvidenceInputs:
     image_quality: Optional[float] = None
     declared_weight_consistency: Optional[float] = None
     weighbridge_weight_consistency: Optional[float] = None
+    # MF#3: force-review flags — any non-empty list downgrades auto_verified → hitl
+    force_review_flags: list = field(default_factory=list)
 
 
 @dataclass
@@ -60,6 +75,8 @@ class EvidenceResult:
     decision: str
     reason: str
     weight_source: Optional[str]
+    # MF#3: echo back which flags were active
+    force_review_flags: list = field(default_factory=list)
 
 
 def classify_evidence(score: float) -> str:
@@ -120,6 +137,7 @@ def compute_evidence(inputs: EvidenceInputs) -> EvidenceResult:
             decision="rejected",
             reason="gate_failed: " + ", ".join(gate_failures),
             weight_source=None,
+            force_review_flags=inputs.force_review_flags,
         )
 
     # 3. Weight signal.
@@ -137,8 +155,15 @@ def compute_evidence(inputs: EvidenceInputs) -> EvidenceResult:
     component_scores["weight_consistency"] = weight_signal
     score = round(sum(weights[k] * component_scores[k] for k in weights), 4)
 
-    # 5. Thresholds.
+    # 5. Classify — then apply MF#3 force-review downgrade.
     decision = classify_evidence(score)
+    flags    = list(inputs.force_review_flags)
+    if decision == "auto_verified" and flags:
+        decision = "hitl"
+        reason   = "force_review: " + ", ".join(flags)
+    else:
+        reason = decision
+
     return EvidenceResult(
         mode=mode,
         gates=gates,
@@ -147,6 +172,7 @@ def compute_evidence(inputs: EvidenceInputs) -> EvidenceResult:
         weights=weights,
         score=score,
         decision=decision,
-        reason=decision,
+        reason=reason,
         weight_source=weight_source,
+        force_review_flags=flags,
     )

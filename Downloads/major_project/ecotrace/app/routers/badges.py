@@ -33,6 +33,18 @@ def reference_badge(badge_id: str, payload: ReferenceRequest, db: Session = Depe
     if existing:
         raise HTTPException(status_code=409, detail="badge_already_referenced")
 
+    # MF#14: obligation ceiling — badge weight must not exceed remaining obligation
+    remaining = obligation.target_kg - obligation.fulfilled_kg
+    if badge.weight_kg > remaining:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"obligation_ceiling_exceeded:"
+                f"badge_weight={badge.weight_kg:.3f}kg "
+                f"remaining={remaining:.3f}kg"
+            ),
+        )
+
     ref = BadgeReference(
         badge_id=badge_id,
         producer_id=payload.producer_id,

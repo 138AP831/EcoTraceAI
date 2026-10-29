@@ -2,10 +2,15 @@
 
 Pure: dataclasses in, dataclasses out. Narration Confidence is separate from the
 Evidence Trust Score and is never blended into one number.
+
+MF#3: force_review_flags — same mechanism as evidence engine. Non-empty list
+downgrades auto_issued → hitl. Supported narration flags:
+  stale_rule    — narration cites superseded regulation version
+  gaming_flag   — clustering of soft-score gaming patterns
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from app.config import NARRATION_AUTO_ISSUED_MIN, NARRATION_HITL_MIN, NARRATION_WEIGHTS
@@ -21,6 +26,8 @@ class NarrationInputs:
     chronological_consistency: float
     no_gaming_flags: float
     corpus_version: str
+    # MF#3: force-review flags — non-empty downgrades auto_issued → hitl
+    force_review_flags: list = field(default_factory=list)
 
 
 @dataclass
@@ -31,6 +38,7 @@ class NarrationResult:
     decision: str
     reason: str
     corpus_version: str
+    force_review_flags: list = field(default_factory=list)
 
 
 def classify_narration(score: float) -> str:
@@ -68,15 +76,26 @@ def compute_narration(inputs: NarrationInputs) -> NarrationResult:
             decision="rejected",
             reason="gate_failed: " + ", ".join(failed_gates),
             corpus_version=corpus_version,
+            force_review_flags=inputs.force_review_flags,
         )
 
-    score = round(sum(NARRATION_WEIGHTS[k] * soft_scores[k] for k in soft_scores), 4)
+    score    = round(sum(NARRATION_WEIGHTS[k] * soft_scores[k] for k in soft_scores), 4)
     decision = classify_narration(score)
+    flags    = list(inputs.force_review_flags)
+
+    # MF#3: downgrade auto_issued → hitl if any force-review flag is set
+    if decision == "auto_issued" and flags:
+        decision = "hitl"
+        reason   = "force_review: " + ", ".join(flags)
+    else:
+        reason = decision
+
     return NarrationResult(
         hard_gates=hard_gates,
         soft_scores=soft_scores,
         score=score,
         decision=decision,
-        reason=decision,
+        reason=reason,
         corpus_version=corpus_version,
+        force_review_flags=flags,
     )

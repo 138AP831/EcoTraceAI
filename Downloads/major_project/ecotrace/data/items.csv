@@ -1,0 +1,3 @@
+# Generated later — populated by seed.generate + seed.load
+# Schema: collection_id,facility_id,picker_id,item_state,category,serial_or_imei,
+#         declared_weight_kg,weighbridge_weight_kg,image_hash,collection_state,intake_at,status

@@ -1,0 +1,7 @@
+id,name,registration_no,authority,state,registration_status,registration_valid_until,geofence_lat,geofence_lng,geofence_radius_m,authorized_categories,daily_capacity_kg
+FAC-HYD-001,GreenCycle Hyderabad,CPCB-EPR-2022-00451,CPCB,Telangana,active,2027-03-31,17.5350,78.2645,200,IT_telecom|consumer_electronics|small_appliances,5000
+FAC-BLR-001,EcoWaste Bangalore,CPCB-EPR-2020-00189,CPCB,Karnataka,active,2026-12-31,13.0705,77.7978,300,IT_telecom|consumer_electronics|large_appliances,8000
+FAC-PUN-001,SafeRecycle Pune,CPCB-EPR-2019-00098,CPCB,Maharashtra,active,2027-06-30,18.7367,74.1580,250,IT_telecom|consumer_electronics|large_appliances|small_appliances|lighting,15000
+FAC-DEL-001,TerraGreen Delhi,CPCB-EPR-2020-00276,CPCB,Delhi,active,2027-01-31,28.6380,77.1025,200,IT_telecom|consumer_electronics,6500
+FAC-CHN-001,CleanTech Chennai,CPCB-EPR-2021-00334,CPCB,Tamil Nadu,active,2026-09-30,13.1143,80.1548,180,IT_telecom|consumer_electronics|small_appliances,3000
+FAC-AHM-001,SafeDispose Ahmedabad,CPCB-EPR-2023-00712,CPCB,Gujarat,active,2027-08-31,22.9716,72.6456,220,IT_telecom|consumer_electronics,4000

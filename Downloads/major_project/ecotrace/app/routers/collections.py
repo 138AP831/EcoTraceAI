@@ -2,6 +2,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -9,7 +10,15 @@ from app.engine.badge_state import can_issue_badge
 from app.engine.completion import CompletionInputs, compute_completion
 from app.engine.evidence import EvidenceInputs, compute_evidence
 from app.engine.narration import NarrationInputs, compute_narration
-from app.models import Collection, Facility, Picker, TrustBadge
+from app.models import (
+    Collection,
+    CompletionRecord,
+    EvidenceAssessment,
+    Facility,
+    NarrationAssessment,
+    Picker,
+    TrustBadge,
+)
 from app.schemas import (
     CollectionCreate,
     CollectionOut,
@@ -20,15 +29,42 @@ from app.schemas import (
     PickerCreate,
     PickerOut,
 )
-from app.services import create_badge, latest_completion, latest_evidence, latest_narration, write_audit
+from app.services import (
+    create_badge,
+    latest_completion,
+    latest_evidence,
+    latest_narration,
+    write_audit,
+)
 
 router = APIRouter(tags=["collections"])
 
-_EVIDENCE_STATUS = {"auto_verified": "evidence_verified", "hitl": "evidence_hitl", "rejected": "evidence_rejected"}
-_NARRATION_STATUS = {"auto_issued": "badge_issued", "hitl": "narration_hitl", "rejected": "narration_rejected"}
+_EVIDENCE_STATUS = {
+    "auto_verified": "evidence_verified",
+    "hitl":          "evidence_hitl",
+    "rejected":      "evidence_rejected",
+}
+_NARRATION_STATUS = {
+    "auto_issued": "badge_issued",
+    "hitl":        "narration_hitl",
+    "rejected":    "narration_rejected",
+}
+
+# Statuses that count as "already verified" for serial-duplicate hard gate (MF#4)
+_VERIFIED_OR_BEYOND = {
+    "evidence_verified",
+    "completion_hold",
+    "completion_passed",
+    "narration_hitl",
+    "narration_rejected",
+    "badge_issued",
+}
 
 
-# ---------------- Pickers ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Pickers
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.post("/pickers", response_model=PickerOut, status_code=status.HTTP_201_CREATED)
 def create_picker(payload: PickerCreate, db: Session = Depends(get_db)):
     data = payload.model_dump(exclude_unset=True)
@@ -51,21 +87,42 @@ def get_picker(picker_id: str, db: Session = Depends(get_db)):
     return picker
 
 
-# ---------------- Collections ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Collections
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.post("/collections", response_model=CollectionOut, status_code=status.HTTP_201_CREATED)
 def create_collection(payload: CollectionCreate, db: Session = Depends(get_db)):
     facility = db.get(Facility, payload.facility_id)
     if not facility:
         raise HTTPException(status_code=422, detail="facility_not_found")
+
     picker = db.get(Picker, payload.picker_id)
     if not picker:
         raise HTTPException(status_code=422, detail="picker_not_found")
 
+    # MF#17: reject if picker is blocked
+    if getattr(picker, "is_blocked", False):
+        raise HTTPException(
+            status_code=409,
+            detail="picker_blocked:picker has been blocked due to fraud or high rejection rate",
+        )
+
     data = payload.model_dump(exclude_unset=True)
     data["facility_state"] = facility.state
-    data["inter_state"] = payload.collection_state != facility.state
+    data["inter_state"]    = payload.collection_state != facility.state
     if data.get("intake_at") is None:
         data["intake_at"] = datetime.utcnow()
+
+    # MF#7: unit normalisation — weight > 500 kg for a single e-waste item is
+    # implausible; treat as grams and convert to kg.
+    if data["declared_weight_kg"] > 500:
+        data["declared_weight_kg"] = round(data["declared_weight_kg"] / 1000, 4)
+        data["unit_normalised"] = True
+    wb = data.get("weighbridge_weight_kg")
+    if wb and wb > 500:
+        data["weighbridge_weight_kg"] = round(wb / 1000, 4)
+
     collection = Collection(**data)
     db.add(collection)
     db.commit()
@@ -79,61 +136,118 @@ def get_collection(collection_id: str, db: Session = Depends(get_db)):
     if not collection:
         raise HTTPException(status_code=404, detail="collection_not_found")
 
-    ev = latest_evidence(db, collection_id)
-    comp = latest_completion(db, collection_id)
-    nar = latest_narration(db, collection_id)
-    badge = db.query(TrustBadge).filter(TrustBadge.collection_id == collection_id).first()
+    ev    = latest_evidence(db, collection_id)
+    comp  = latest_completion(db, collection_id)
+    nar   = latest_narration(db, collection_id)
+    badge = (
+        db.query(TrustBadge)
+        .filter(TrustBadge.collection_id == collection_id)
+        .first()
+    )
 
     def _dt(v):
-        return v.isoformat() if isinstance(v, (datetime,)) else v
+        return v.isoformat() if isinstance(v, datetime) else v
 
-    out = CollectionOut.model_validate(collection).model_dump()
-    out["evidence"] = _serialize_evidence(ev) if ev else None
-    out["completion"] = _serialize_completion(comp) if comp else None
-    out["narration"] = _serialize_narration(nar) if nar else None
-    out["badge"] = (
-        {"id": badge.id, "status": badge.status, "evidence_score": badge.evidence_score,
-         "narration_score": badge.narration_score, "weight_kg": badge.weight_kg,
-         "issued_at": _dt(badge.issued_at)}
+    out            = CollectionOut.model_validate(collection).model_dump()
+    out["evidence"]   = _serialize_evidence(ev)   if ev    else None
+    out["completion"] = _serialize_completion(comp) if comp  else None
+    out["narration"]  = _serialize_narration(nar)  if nar   else None
+    out["badge"]      = (
+        {
+            "id":             badge.id,
+            "status":         badge.status,
+            "evidence_score": badge.evidence_score,
+            "narration_score":badge.narration_score,
+            "weight_kg":      badge.weight_kg,
+            "issued_at":      _dt(badge.issued_at),
+        }
         if badge else None
     )
     return out
 
 
-def _serialize_evidence(ev):
+def _serialize_evidence(ev) -> dict:
     return {
-        "id": ev.id, "mode": ev.mode, "component_scores": ev.component_scores,
-        "gates": ev.gates, "score": ev.score, "decision": ev.decision,
-        "reason": ev.reason, "weight_source": ev.weight_source,
+        "id":               ev.id,
+        "mode":             ev.mode,
+        "component_scores": ev.component_scores,
+        "gates":            ev.gates,
+        "score":            ev.score,
+        "decision":         ev.decision,
+        "reason":           ev.reason,
+        "weight_source":    ev.weight_source,
     }
 
 
-def _serialize_completion(comp):
+def _serialize_completion(comp) -> dict:
     return {
-        "id": comp.id, "evidence_type": comp.evidence_type,
-        "submitted_at": comp.submitted_at.isoformat() if comp.submitted_at else None,
-        "invoice_weight_kg": comp.invoice_weight_kg, "invoice_buyer_id": comp.invoice_buyer_id,
-        "facility_revalidated": comp.facility_revalidated, "manifest_present": comp.manifest_present,
-        "passed": comp.passed, "failure_reasons": comp.failure_reasons,
+        "id":                  comp.id,
+        "evidence_type":       comp.evidence_type,
+        "submitted_at":        comp.submitted_at.isoformat() if comp.submitted_at else None,
+        "invoice_weight_kg":   comp.invoice_weight_kg,
+        "invoice_buyer_id":    comp.invoice_buyer_id,
+        "invoice_number":      getattr(comp, "invoice_number", None),
+        "facility_revalidated":comp.facility_revalidated,
+        "manifest_present":    comp.manifest_present,
+        "passed":              comp.passed,
+        "failure_reasons":     comp.failure_reasons,
     }
 
 
-def _serialize_narration(nar):
+def _serialize_narration(nar) -> dict:
     return {
-        "id": nar.id, "hard_gates": nar.hard_gates, "soft_scores": nar.soft_scores,
-        "score": nar.score, "decision": nar.decision, "reason": nar.reason,
-        "corpus_version": nar.corpus_version, "sanitizer_passed": nar.sanitizer_passed,
+        "id":               nar.id,
+        "hard_gates":       nar.hard_gates,
+        "soft_scores":      nar.soft_scores,
+        "score":            nar.score,
+        "decision":         nar.decision,
+        "reason":           nar.reason,
+        "corpus_version":   nar.corpus_version,
+        "sanitizer_passed": nar.sanitizer_passed,
     }
 
 
-# ---------------- Evidence ----------------
-@router.post("/collections/{collection_id}/evidence", status_code=status.HTTP_201_CREATED)
-def assess_evidence(collection_id: str, payload: EvidenceRequest, db: Session = Depends(get_db)):
+# ─────────────────────────────────────────────────────────────────────────────
+# Evidence
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/collections/{collection_id}/evidence",
+    status_code=status.HTTP_201_CREATED,
+)
+def assess_evidence(
+    collection_id: str,
+    payload: EvidenceRequest,
+    db: Session = Depends(get_db),
+):
     collection = db.get(Collection, collection_id)
     if not collection:
         raise HTTPException(status_code=404, detail="collection_not_found")
     if collection.status != "submitted":
-        raise HTTPException(status_code=409, detail=f"evidence_not_allowed_from_status:{collection.status}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"evidence_not_allowed_from_status:{collection.status}",
+        )
+
+    # MF#4: serial duplicate hard gate for intact items.
+    # If another collection with the same serial_or_imei has already passed
+    # evidence verification (or beyond), reject this one immediately.
+    if (
+        collection.item_state == "intact"
+        and collection.serial_or_imei
+    ):
+        conflict = (
+            db.query(Collection)
+            .filter(
+                Collection.serial_or_imei == collection.serial_or_imei,
+                Collection.id != collection_id,
+                Collection.status.in_(_VERIFIED_OR_BEYOND),
+            )
+            .first()
+        )
+        if conflict:
+            # Force duplicate_detected so the engine records the correct gate failure
+            payload = payload.model_copy(update={"duplicate_detected": True})
 
     fields = payload.model_dump()
     inputs = EvidenceInputs(item_state=collection.item_state, **fields)
@@ -142,110 +256,155 @@ def assess_evidence(collection_id: str, payload: EvidenceRequest, db: Session = 
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"invalid_field:{e}")
 
-    from app.models import EvidenceAssessment
-
     mode = "A" if collection.item_state == "intact" else "B"
     ea = EvidenceAssessment(
-        collection_id=collection_id,
-        mode=mode,
-        component_scores=result.component_scores,
-        gates=result.gates,
-        score=result.score,
-        decision=result.decision,
-        reason=result.reason,
-        weight_source=result.weight_source,
+        collection_id   = collection_id,
+        mode            = mode,
+        component_scores= result.component_scores,
+        gates           = result.gates,
+        score           = result.score,
+        decision        = result.decision,
+        reason          = result.reason,
+        weight_source   = result.weight_source,
     )
     db.add(ea)
     collection.status = _EVIDENCE_STATUS[result.decision]
     db.flush()
-    write_audit(db, "collection", collection_id, "evidence_assessed",
-                {"decision": result.decision, "score": result.score})
+    write_audit(
+        db, "collection", collection_id, "evidence_assessed",
+        {"decision": result.decision, "score": result.score,
+         "force_review_flags": result.force_review_flags},
+    )
     db.commit()
     db.refresh(ea)
     return _serialize_evidence(ea) | {"collection_status": collection.status}
 
 
-# ---------------- Completion ----------------
-@router.post("/collections/{collection_id}/completion", status_code=status.HTTP_201_CREATED)
-def assess_completion(collection_id: str, payload: CompletionRequest, db: Session = Depends(get_db)):
+# ─────────────────────────────────────────────────────────────────────────────
+# Completion
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/collections/{collection_id}/completion",
+    status_code=status.HTTP_201_CREATED,
+)
+def assess_completion(
+    collection_id: str,
+    payload: CompletionRequest,
+    db: Session = Depends(get_db),
+):
     collection = db.get(Collection, collection_id)
     if not collection:
         raise HTTPException(status_code=404, detail="collection_not_found")
     if collection.status not in ("evidence_verified", "completion_hold"):
-        raise HTTPException(status_code=409, detail=f"completion_not_allowed_from_status:{collection.status}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"completion_not_allowed_from_status:{collection.status}",
+        )
+
+    # MF#9: invoice number uniqueness — reject if the same invoice_number has
+    # already been used in another CompletionRecord.
+    invoice_number = getattr(payload, "invoice_number", None)
+    if invoice_number:
+        existing_inv = (
+            db.query(CompletionRecord)
+            .filter(
+                CompletionRecord.invoice_number == invoice_number,
+                CompletionRecord.collection_id != collection_id,
+            )
+            .first()
+        )
+        if existing_inv:
+            raise HTTPException(
+                status_code=409,
+                detail=f"invoice_number_reuse:{invoice_number}",
+            )
 
     inputs = CompletionInputs(
-        intake_at=collection.intake_at,
-        submitted_at=payload.submitted_at,
-        evidence_type=payload.evidence_type,
-        facility_registration_active_now=payload.facility_registration_active_now,
-        inter_state=collection.inter_state,
-        manifest_present=payload.manifest_present,
-        invoice_weight_kg=payload.invoice_weight_kg,
-        weighbridge_weight_kg=collection.weighbridge_weight_kg,
-        invoice_buyer_id=payload.invoice_buyer_id,
-        facility_id=collection.facility_id,
+        intake_at                    = collection.intake_at,
+        submitted_at                 = payload.submitted_at,
+        evidence_type                = payload.evidence_type,
+        facility_registration_active_now = payload.facility_registration_active_now,
+        inter_state                  = collection.inter_state,
+        manifest_present             = payload.manifest_present,
+        invoice_weight_kg            = payload.invoice_weight_kg,
+        weighbridge_weight_kg        = collection.weighbridge_weight_kg,
+        invoice_buyer_id             = payload.invoice_buyer_id,
+        facility_id                  = collection.facility_id,
     )
     result = compute_completion(inputs)
 
-    from app.models import CompletionRecord
-
     cr = CompletionRecord(
-        collection_id=collection_id,
-        evidence_type=payload.evidence_type,
-        submitted_at=payload.submitted_at,
-        invoice_weight_kg=payload.invoice_weight_kg,
-        invoice_buyer_id=payload.invoice_buyer_id,
-        facility_revalidated=payload.facility_registration_active_now,
-        manifest_present=payload.manifest_present,
-        passed=result.passed,
-        failure_reasons=result.failure_reasons,
+        collection_id          = collection_id,
+        evidence_type          = payload.evidence_type,
+        submitted_at           = payload.submitted_at,
+        invoice_weight_kg      = payload.invoice_weight_kg,
+        invoice_buyer_id       = payload.invoice_buyer_id,
+        invoice_number         = invoice_number,
+        facility_revalidated   = payload.facility_registration_active_now,
+        manifest_present       = payload.manifest_present,
+        passed                 = result.passed,
+        failure_reasons        = result.failure_reasons,
     )
     db.add(cr)
     collection.status = "completion_passed" if result.passed else "completion_hold"
     db.flush()
-    write_audit(db, "collection", collection_id, "completion_assessed",
-                {"passed": result.passed, "failure_reasons": result.failure_reasons})
+    write_audit(
+        db, "collection", collection_id, "completion_assessed",
+        {"passed": result.passed, "failure_reasons": result.failure_reasons},
+    )
     db.commit()
     db.refresh(cr)
     return _serialize_completion(cr) | {"collection_status": collection.status}
 
 
-# ---------------- Narration ----------------
-@router.post("/collections/{collection_id}/narration", status_code=status.HTTP_201_CREATED)
-def assess_narration(collection_id: str, payload: NarrationRequest, db: Session = Depends(get_db)):
+# ─────────────────────────────────────────────────────────────────────────────
+# Narration
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/collections/{collection_id}/narration",
+    status_code=status.HTTP_201_CREATED,
+)
+def assess_narration(
+    collection_id: str,
+    payload: NarrationRequest,
+    db: Session = Depends(get_db),
+):
     collection = db.get(Collection, collection_id)
     if not collection:
         raise HTTPException(status_code=404, detail="collection_not_found")
     if collection.status != "completion_passed":
-        raise HTTPException(status_code=409, detail=f"narration_not_allowed_from_status:{collection.status}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"narration_not_allowed_from_status:{collection.status}",
+        )
 
     inputs = NarrationInputs(
-        sanitizer_passed=payload.sanitizer_passed,
-        numeric_verification_passed=payload.numeric_verification_passed,
-        uniqueness_check_passed=payload.uniqueness_check_passed,
-        regulatory_grounding=payload.regulatory_grounding,
-        cross_document_consistency=payload.cross_document_consistency,
-        chronological_consistency=payload.chronological_consistency,
-        no_gaming_flags=payload.no_gaming_flags,
-        corpus_version=payload.corpus_version,
+        sanitizer_passed             = payload.sanitizer_passed,
+        numeric_verification_passed  = payload.numeric_verification_passed,
+        uniqueness_check_passed      = payload.uniqueness_check_passed,
+        regulatory_grounding         = payload.regulatory_grounding,
+        cross_document_consistency   = payload.cross_document_consistency,
+        chronological_consistency    = payload.chronological_consistency,
+        no_gaming_flags              = payload.no_gaming_flags,
+        corpus_version               = payload.corpus_version,
+        force_review_flags           = payload.force_review_flags,
     )
     try:
         result = compute_narration(inputs)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"invalid_field:{e}")
 
-    from app.models import NarrationAssessment
-
     na = NarrationAssessment(
-        collection_id=collection_id,
-        hard_gates=result.hard_gates,
-        soft_scores=result.soft_scores,
-        score=result.score,
-        decision=result.decision,
-        reason=result.reason,
-        corpus_version=result.corpus_version,
-        sanitizer_passed=payload.sanitizer_passed,
+        collection_id    = collection_id,
+        hard_gates       = result.hard_gates,
+        soft_scores      = result.soft_scores,
+        score            = result.score,
+        decision         = result.decision,
+        reason           = result.reason,
+        corpus_version   = result.corpus_version,
+        sanitizer_passed = payload.sanitizer_passed,
     )
     db.add(na)
 
@@ -253,55 +412,79 @@ def assess_narration(collection_id: str, payload: NarrationRequest, db: Session 
     if result.decision == "auto_issued":
         collection.status = "badge_issued"
         db.flush()
-        badge = create_badge(db, collection, result.score)
+        badge    = create_badge(db, collection, result.score)
         badge_id = badge.id
-        write_audit(db, "badge", badge_id, "badge_issued", {"collection_id": collection_id})
+        write_audit(db, "badge", badge_id, "badge_issued",
+                    {"collection_id": collection_id})
     else:
         collection.status = _NARRATION_STATUS[result.decision]
 
     write_audit(db, "collection", collection_id, "narration_assessed",
-                {"decision": result.decision, "score": result.score})
+                {"decision": result.decision, "score": result.score,
+                 "force_review_flags": result.force_review_flags})
     db.commit()
     db.refresh(na)
     out = _serialize_narration(na)
-    out["badge_id"] = badge_id
-    out["collection_status"] = collection.status
+    out["badge_id"]         = badge_id
+    out["collection_status"]= collection.status
     return out
 
 
-# ---------------- HITL approve ----------------
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL approve
+# ─────────────────────────────────────────────────────────────────────────────
+
 @router.post("/collections/{collection_id}/hitl-approve")
-def hitl_approve(collection_id: str, payload: HitlApproveRequest, db: Session = Depends(get_db)):
+def hitl_approve(
+    collection_id: str,
+    payload: HitlApproveRequest,
+    db: Session = Depends(get_db),
+):
     collection = db.get(Collection, collection_id)
     if not collection:
         raise HTTPException(status_code=404, detail="collection_not_found")
 
-    stage = payload.stage
+    stage    = payload.stage
     approved = payload.approved
     badge_id = None
 
     if stage == "evidence":
         if collection.status != "evidence_hitl":
-            raise HTTPException(status_code=409, detail=f"hitl_evidence_not_allowed_from_status:{collection.status}")
+            raise HTTPException(
+                status_code=409,
+                detail=f"hitl_evidence_not_allowed_from_status:{collection.status}",
+            )
         collection.status = "evidence_verified" if approved else "evidence_rejected"
-        write_audit(db, "collection", collection_id, "hitl_approve", {"stage": "evidence", "approved": approved})
+        write_audit(db, "collection", collection_id, "hitl_approve",
+                    {"stage": "evidence", "approved": approved})
+
     elif stage == "narration":
         if collection.status != "narration_hitl":
-            raise HTTPException(status_code=409, detail=f"hitl_narration_not_allowed_from_status:{collection.status}")
-        badge_id = None
+            raise HTTPException(
+                status_code=409,
+                detail=f"hitl_narration_not_allowed_from_status:{collection.status}",
+            )
         if approved:
             collection.status = "badge_issued"
-            nar = latest_narration(db, collection_id)
+            nar      = latest_narration(db, collection_id)
             db.flush()
-            badge = create_badge(db, collection, nar.score if nar else None)
+            badge    = create_badge(db, collection, nar.score if nar else None)
             badge_id = badge.id
-            write_audit(db, "badge", badge_id, "badge_issued", {"collection_id": collection_id})
+            write_audit(db, "badge", badge_id, "badge_issued",
+                        {"collection_id": collection_id})
         else:
             collection.status = "narration_rejected"
-        write_audit(db, "collection", collection_id, "hitl_approve", {"stage": "narration", "approved": approved})
+        write_audit(db, "collection", collection_id, "hitl_approve",
+                    {"stage": "narration", "approved": approved})
+
     else:
         raise HTTPException(status_code=422, detail="invalid_stage")
 
     db.commit()
-    return {"collection_id": collection_id, "stage": stage, "approved": approved,
-            "new_status": collection.status, "badge_id": badge_id if stage == "narration" and approved else None}
+    return {
+        "collection_id": collection_id,
+        "stage":         stage,
+        "approved":      approved,
+        "new_status":    collection.status,
+        "badge_id":      badge_id if (stage == "narration" and approved) else None,
+    }
